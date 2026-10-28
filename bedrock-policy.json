@@ -1,0 +1,5 @@
+{"Version":"2012-10-17","Statement":[
+ {"Effect":"Allow","Action":["bedrock:InvokeModel","bedrock:InvokeModelWithResponseStream"],
+  "Resource":["arn:aws:bedrock:*::foundation-model/*","arn:aws:bedrock:*:393840684076:inference-profile/*"]},
+ {"Effect":"Allow","Action":"bedrock:ApplyGuardrail",
+  "Resource":"arn:aws:bedrock:us-east-1:393840684076:guardrail/zj9i9becevfk"}]}
