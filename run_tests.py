@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Run every case in test_cases.json against the chat API and print a report.
+Run every case in test_cases.json against the chat API and save the raw results.
 
 Usage:
     source env.sh
-    python3 run_tests.py
+    python3 run_tests.py                    # results saved as results/run_<timestamp>.json
+    RUN_LABEL=sonnet46 python3 run_tests.py # optional label in the file name
 
+Then build a report from the results with report.py.
 Needs only Python 3 (no pip installs). Reads the API from $API_URL.
-Writes a report file: test_report_<timestamp>.md
 """
 import json
 import os
@@ -19,6 +20,7 @@ from datetime import datetime
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CASES_FILE = os.path.join(HERE, "test_cases.json")
+RESULTS_DIR = os.path.join(HERE, "results")
 
 # Guardrail hit names -> simple categories used in test_cases.json
 PCI = {"CREDIT_DEBIT_CARD_NUMBER", "CREDIT_DEBIT_CARD_CVV", "CREDIT_DEBIT_CARD_EXPIRY", "PIN",
@@ -96,6 +98,9 @@ def check(case, status, body):
         want = set(exp.get("categories", []))
         if blocked and want and cats and not (want & cats):
             problems.append(f"blocked by {sorted(cats)}, expected {sorted(want)}")
+    elif outcome == "block_or_mask":
+        if not blocked and "pii_masked" not in cats:
+            problems.append(f"was neither blocked nor masked (HTTP {status})")
     elif outcome == "block_or_decline":
         if status not in (200, 422):
             problems.append(f"unexpected HTTP {status}")
@@ -116,10 +121,12 @@ def main():
     url = api.rstrip("/")
     if not url.endswith("/chat"):
         url += "/chat"
+    label = os.environ.get("RUN_LABEL", "run")
 
     with open(CASES_FILE) as f:
         cases = json.load(f)["cases"]
 
+    started = datetime.now()
     print(f"Running {len(cases)} tests against {url}\n")
     results = []
     for case in cases:
@@ -127,68 +134,42 @@ def main():
         if "prompt_repeat" in case:
             prompt = case["prompt_repeat"]["text"] * case["prompt_repeat"]["times"]
 
+        t0 = time.time()
         status, body = call_api(url, prompt)
+        latency_ms = round((time.time() - t0) * 1000)
         problems = check(case, status, body)
         passed = not problems
-        hits = ", ".join(body.get("guardrail_hits") or []) or "-"
-        reply = (body.get("response") or body.get("error") or "").replace("\n", " ")
 
-        print(f"[{'PASS' if passed else 'FAIL'}] {case['id']:<4} {case['name']:<38} "
-              f"HTTP {status}  hits: {hits}")
-        if not passed:
-            print(f"       problem: {'; '.join(problems)}")
-            print(f"       reply:   {reply[:160]}")
-
-        results.append({"case": case, "status": status, "hits": hits,
-                        "reply": reply, "passed": passed, "problems": problems})
+        print(f"[{'PASS' if passed else 'FAIL'}] {case['id']:<4} {case['name']:<38} HTTP {status}")
+        results.append({
+            "id": case["id"],
+            "category": case["category"],
+            "name": case["name"],
+            "expected": case["expect"]["outcome"],
+            "prompt": prompt[:300],
+            "status": status,
+            "blocked": bool(body.get("blocked")) or status == 422,
+            "stop_reason": body.get("stop_reason"),
+            "guardrail_hits": body.get("guardrail_hits") or [],
+            "reply": (body.get("response") or body.get("error") or "")[:1000],
+            "usage": body.get("usage") or {},
+            "latency_ms": latency_ms,
+            "passed": passed,
+            "problems": problems,
+        })
         time.sleep(0.2)  # stay under the API throttle
 
-    write_report(url, results)
-
-
-def write_report(url, results):
-    total = len(results)
     passed = sum(r["passed"] for r in results)
-    failed = [r for r in results if not r["passed"]]
-
-    # Summary by category
-    groups = {}
-    for r in results:
-        g = groups.setdefault(r["case"]["category"], [0, 0])
-        g[0] += r["passed"]
-        g[1] += 1
-
-    print("\n" + "=" * 60)
-    print(f"RESULT: {passed}/{total} passed, {len(failed)} failed")
-    print("=" * 60)
-    for name, (p, t) in groups.items():
-        print(f"  {name:<18} {p}/{t}")
-    if failed:
-        print("\nFailed tests:")
-        for r in failed:
-            print(f"  {r['case']['id']}  {r['case']['name']}: {'; '.join(r['problems'])}")
-
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    path = os.path.join(HERE, f"test_report_{stamp}.md")
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    path = os.path.join(RESULTS_DIR, f"{label}_{started:%Y%m%d-%H%M%S}.json")
     with open(path, "w") as f:
-        f.write(f"# Guardrail test report\n\n")
-        f.write(f"- Run at: {datetime.now():%Y-%m-%d %H:%M:%S}\n- API: {url}\n")
-        f.write(f"- Result: **{passed}/{total} passed, {len(failed)} failed**\n\n")
-        f.write("## By category\n\n| Category | Passed |\n|---|---|\n")
-        for name, (p, t) in groups.items():
-            f.write(f"| {name} | {p}/{t} |\n")
-        if failed:
-            f.write("\n## Failures\n\n| ID | Test | Problem | Reply |\n|---|---|---|---|\n")
-            for r in failed:
-                f.write(f"| {r['case']['id']} | {r['case']['name']} | {'; '.join(r['problems'])} "
-                        f"| {r['reply'][:120].replace('|', '/')} |\n")
-        f.write("\n## All tests\n\n| Result | ID | Test | Expected | HTTP | Guardrail hits |\n"
-                "|---|---|---|---|---|---|\n")
-        for r in results:
-            f.write(f"| {'PASS' if r['passed'] else 'FAIL'} | {r['case']['id']} | {r['case']['name']} "
-                    f"| {r['case']['expect']['outcome']} | {r['status']} | {r['hits']} |\n")
-    print(f"\nReport saved: {path}")
-    sys.exit(0 if not failed else 1)
+        json.dump({"label": label, "api": url, "run_at": started.isoformat(timespec="seconds"),
+                   "total": len(results), "passed": passed, "results": results}, f, indent=2)
+
+    print(f"\nRESULT: {passed}/{len(results)} passed")
+    print(f"Results saved: {path}")
+    print("Build a report:  python3 report.py")
+    sys.exit(0 if passed == len(results) else 1)
 
 
 if __name__ == "__main__":
