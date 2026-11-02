@@ -4,8 +4,12 @@ Run every case in test_cases.json against the chat API and save the raw results.
 
 Usage:
     source env.sh
-    python3 run_tests.py                    # results saved as results/run_<timestamp>.json
-    RUN_LABEL=sonnet46 python3 run_tests.py # optional label in the file name
+    python3 run_tests.py                     # all projects; results/run_<timestamp>.json
+    TEST_PROJECT=mortgage python3 run_tests.py    # one project only
+    RUN_LABEL=sonnet46 python3 run_tests.py  # optional label in the file name
+
+Shared cases (no "project" field) run once for every project listed in test_cases.json.
+Cases with a "project" field run once, against that project.
 
 Then build a report from the results with report.py.
 Needs only Python 3 (no pip installs). Reads the API from $API_URL.
@@ -46,9 +50,13 @@ def categories(hits):
     return cats
 
 
-def call_api(url, prompt):
-    """POST the prompt. Returns (status, body_dict). Retries if throttled."""
-    data = json.dumps({"prompt": prompt}).encode()
+def call_api(url, prompt, project, extra=None):
+    """POST the prompt for a project. Returns (status, body_dict). Retries if throttled."""
+    payload = dict(extra or {})
+    payload["prompt"] = prompt
+    if project is not None:
+        payload["project"] = project
+    data = json.dumps(payload).encode()
     for attempt in range(4):
         req = urllib.request.Request(url, data=data, method="POST",
                                      headers={"Content-Type": "application/json"})
@@ -124,25 +132,43 @@ def main():
     label = os.environ.get("RUN_LABEL", "run")
 
     with open(CASES_FILE) as f:
-        cases = json.load(f)["cases"]
+        data = json.load(f)
+    cases = data["cases"]
+    projects = data.get("projects") or [None]
+    only = os.environ.get("TEST_PROJECT")
+    if only:
+        projects = [only]
+
+    # Build the list of (case, project) runs.
+    jobs = []
+    for case in cases:
+        if "project" not in case:                       # shared: once per project
+            jobs += [(case, p) for p in projects]
+        elif not only or case["project"] == only or case["project"] not in data.get("projects", []):
+            jobs.append((case, case["project"]))        # project-specific: once
 
     started = datetime.now()
-    print(f"Running {len(cases)} tests against {url}\n")
+    print(f"Running {len(jobs)} tests ({len(projects)} project(s)) against {url}\n")
     results = []
-    for case in cases:
+    for case, project in jobs:
         prompt = case.get("prompt", "")
         if "prompt_repeat" in case:
             prompt = case["prompt_repeat"]["text"] * case["prompt_repeat"]["times"]
 
         t0 = time.time()
-        status, body = call_api(url, prompt)
+        status, body = call_api(url, prompt, project, case.get("extra_body"))
         latency_ms = round((time.time() - t0) * 1000)
         problems = check(case, status, body)
         passed = not problems
 
-        print(f"[{'PASS' if passed else 'FAIL'}] {case['id']:<4} {case['name']:<38} HTTP {status}")
+        print(f"[{'PASS' if passed else 'FAIL'}] {str(project):<20} {case['id']:<4} "
+              f"{case['name']:<38} HTTP {status}")
+        if not passed:
+            print(f"       problem: {'; '.join(problems)}")
         results.append({
-            "id": case["id"],
+            "id": f"{project}/{case['id']}",
+            "case_id": case["id"],
+            "project": str(project),
             "category": case["category"],
             "name": case["name"],
             "expected": case["expect"]["outcome"],
@@ -167,6 +193,9 @@ def main():
                    "total": len(results), "passed": passed, "results": results}, f, indent=2)
 
     print(f"\nRESULT: {passed}/{len(results)} passed")
+    for p in dict.fromkeys(r["project"] for r in results):
+        rs = [r for r in results if r["project"] == p]
+        print(f"  {p:<22} {sum(r['passed'] for r in rs)}/{len(rs)}")
     print(f"Results saved: {path}")
     print("Build a report:  python3 report.py")
     sys.exit(0 if passed == len(results) else 1)

@@ -1,0 +1,3 @@
+{"Version":"2012-10-17","Statement":[
+ {"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::bedrock-guarded-config-393840684076/projects/*"},
+ {"Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::bedrock-guarded-config-393840684076","Condition":{"StringLike":{"s3:prefix":"projects/*"}}}]}
